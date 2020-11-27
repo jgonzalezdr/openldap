@@ -47,17 +47,18 @@ typedef struct dynlist_map_t {
 typedef struct dynlist_info_t {
 	ObjectClass		*dli_oc;
 	AttributeDescription	*dli_ad;
+	struct berval		dli_default_uri;
 	struct dynlist_map_t	*dli_dlm;
-	struct berval		dli_uri;
-	LDAPURLDesc		*dli_lud;
-	struct berval		dli_uri_nbase;
-	Filter			*dli_uri_filter;
+	struct berval		dli_ocfilter_uri;
+	LDAPURLDesc		*dli_ocfilter_lud;
+	struct berval		dli_ocfilter_nbase;
+	Filter			*dli_ocfilter_filter;
 	struct berval		dli_default_filter;
 	struct dynlist_info_t	*dli_next;
 } dynlist_info_t;
 
 #define DYNLIST_USAGE \
-	"\"dynlist-attrset <oc> [uri] <URL-ad> [[<mapped-ad>:]<member-ad> ...]\": "
+	"\"dynlist-attrset <oc> [filter-uri] <URL-ad> [default-uri] [[<mapped-ad>:]<member-ad> ...]\": "
 
 static dynlist_info_t *
 dynlist_is_dynlist_next( Operation *op, SlapReply *rs, dynlist_info_t *old_dli )
@@ -83,18 +84,18 @@ dynlist_is_dynlist_next( Operation *op, SlapReply *rs, dynlist_info_t *old_dli )
 	}
 
 	for ( ; dli; dli = dli->dli_next ) {
-		if ( dli->dli_lud != NULL ) {
+		if ( dli->dli_ocfilter_lud != NULL ) {
 			/* check base and scope */
-			if ( !BER_BVISNULL( &dli->dli_uri_nbase )
+			if ( !BER_BVISNULL( &dli->dli_ocfilter_nbase )
 				&& !dnIsSuffixScope( &rs->sr_entry->e_nname,
-					&dli->dli_uri_nbase,
-					dli->dli_lud->lud_scope ) )
+					&dli->dli_ocfilter_nbase,
+					dli->dli_ocfilter_lud->lud_scope ) )
 			{
 				continue;
 			}
 
 			/* check filter */
-			if ( dli->dli_uri_filter && test_filter( op, rs->sr_entry, dli->dli_uri_filter ) != LDAP_COMPARE_TRUE ) {
+			if ( dli->dli_ocfilter_filter && test_filter( op, rs->sr_entry, dli->dli_ocfilter_filter ) != LDAP_COMPARE_TRUE ) {
 				continue;
 			}
 		}
@@ -341,7 +342,188 @@ done:;
 
 	return 0;
 }
+
+static void
+dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, struct berval *url )
+{
+	LDAPURLDesc	*lud = NULL;
+	int		i, j;
+	struct berval	dn;
+	int		rc;
+
+	BER_BVZERO( &o->o_req_dn );
+	BER_BVZERO( &o->o_req_ndn );
+	o->ors_filter = NULL;
+	o->ors_attrs = NULL;
+	BER_BVZERO( &o->ors_filterstr );
+
+	if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
+		/* FIXME: error? */
+		return;
+	}
+
+	if ( lud->lud_host != NULL ) {
+		/* FIXME: host not allowed; reject as illegal? */
+		Debug( LDAP_DEBUG_ANY, "dynlist_prepare_entry(\"%s\"): "
+			"illegal URI \"%s\"\n",
+			e->e_name.bv_val, url->bv_val, 0 );
+		goto cleanup;
+	}
+
+	if ( lud->lud_dn == NULL ) {
+		/* note that an empty base is not honored in terms
+			* of defaultSearchBase, because select_backend()
+			* is not aware of the defaultSearchBase option;
+			* this can be useful in case of a database serving
+			* the empty suffix */
+		BER_BVSTR( &dn, "" );
+
+	} else {
+		ber_str2bv( lud->lud_dn, 0, 0, &dn );
+	}
+	rc = dnPrettyNormal( NULL, &dn, &o->o_req_dn, &o->o_req_ndn, op->o_tmpmemctx );
+	if ( rc != LDAP_SUCCESS ) {
+		/* FIXME: error? */
+		goto cleanup;
+	}
+	o->ors_scope = lud->lud_scope;
+
+	for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+		if ( dlm->dlm_mapped_ad != NULL ) {
+			break;
+		}
+	}
+
+	if ( dli->dli_dlm && !dlm ) {
+		/* if ( lud->lud_attrs != NULL ),
+			* the URL should be ignored */
+		o->ors_attrs = slap_anlist_no_attrs;
+
+	} else if ( lud->lud_attrs == NULL ) {
+		o->ors_attrs = rs->sr_attrs;
+
+	} else {
+		for ( i = 0; lud->lud_attrs[i]; i++)
+			/* just count */ ;
+
+		o->ors_attrs = op->o_tmpcalloc( i + 1, sizeof( AttributeName ), op->o_tmpmemctx );
+		for ( i = 0, j = 0; lud->lud_attrs[i]; i++) {
+			const char	*text = NULL;
+
+			ber_str2bv( lud->lud_attrs[i], 0, 0, &o->ors_attrs[j].an_name );
+			o->ors_attrs[j].an_desc = NULL;
+			(void)slap_bv2ad( &o->ors_attrs[j].an_name, &o->ors_attrs[j].an_desc, &text );
+			/* FIXME: ignore errors... */
+
+			if ( rs->sr_attrs == NULL ) {
+				if ( o->ors_attrs[j].an_desc != NULL &&
+						is_at_operational( o->ors_attrs[j].an_desc->ad_type ) )
+				{
+					continue;
+				}
+
+			} else {
+				if ( o->ors_attrs[j].an_desc != NULL &&
+						is_at_operational( o->ors_attrs[j].an_desc->ad_type ) )
+				{
+					if ( !opattrs ) {
+						continue;
+					}
+
+					if ( !ad_inlist( o->ors_attrs[j].an_desc, rs->sr_attrs ) ) {
+						/* lookup if mapped -- linear search,
+							* not very efficient unless list
+							* is very short */
+						for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+							if ( dlm->dlm_member_ad == o->ors_attrs[j].an_desc ) {
+								break;
+							}
+						}
+
+						if ( dlm == NULL ) {
+							continue;
+						}
+					}
+
+				} else {
+					if ( !userattrs && 
+							o->ors_attrs[j].an_desc != NULL &&
+							!ad_inlist( o->ors_attrs[j].an_desc, rs->sr_attrs ) )
+					{
+						/* lookup if mapped -- linear search,
+							* not very efficient unless list
+							* is very short */
+						for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+							if ( dlm->dlm_member_ad == o->ors_attrs[j].an_desc ) {
+								break;
+							}
+						}
+
+						if ( dlm == NULL ) {
+							continue;
+						}
+					}
+				}
+			}
+
+			j++;
+		}
+
+		if ( j == 0 ) {
+			goto cleanup;
+		}
 	
+		BER_BVZERO( &o->ors_attrs[j].an_name );
+	}
+
+	if ( lud->lud_filter == NULL ) {
+		ber_dupbv_x( &o->ors_filterstr,
+				&dli->dli_default_filter, op->o_tmpmemctx );
+
+	} else {
+		struct berval	flt;
+		ber_str2bv( lud->lud_filter, 0, 0, &flt );
+		if ( dynlist_make_filter( op, rs->sr_entry, url->bv_val, &flt, &o->ors_filterstr ) ) {
+			/* error */
+			goto cleanup;
+		}
+	}
+	o->ors_filter = str2filter_x( op, o->ors_filterstr.bv_val );
+	if ( o->ors_filter == NULL ) {
+		goto cleanup;
+	}
+	
+	o->o_bd = select_backend( &o->o_req_ndn, 1 );
+	if ( o->o_bd && o->o_bd->be_search ) {
+		SlapReply	r = { REP_SEARCH };
+		r.sr_attr_flags = slap_attr_flags( o->ors_attrs );
+		(void)o->o_bd->be_search( &o, &r );
+	}
+
+cleanup:;
+	if ( id ) {
+		slap_op_groups_free( &o );
+	}
+	if ( o->ors_filter ) {
+		filter_free_x( &o, o->ors_filter, 1 );
+	}
+	if ( o->ors_attrs && o->ors_attrs != rs->sr_attrs
+			&& o->ors_attrs != slap_anlist_no_attrs )
+	{
+		op->o_tmpfree( o->ors_attrs, op->o_tmpmemctx );
+	}
+	if ( !BER_BVISNULL( &o->o_req_dn ) ) {
+		op->o_tmpfree( o->o_req_dn.bv_val, op->o_tmpmemctx );
+	}
+	if ( !BER_BVISNULL( &o->o_req_ndn ) ) {
+		op->o_tmpfree( o->o_req_ndn.bv_val, op->o_tmpmemctx );
+	}
+	assert( BER_BVISNULL( &o->ors_filterstr )
+		|| o->ors_filterstr.bv_val != lud->lud_filter );
+	op->o_tmpfree( o->ors_filterstr.bv_val, op->o_tmpmemctx );
+	ldap_free_urldesc( lud );
+}
+
 static int
 dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 {
@@ -411,183 +593,12 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 	o.ors_tlimit = SLAP_NO_LIMIT;
 	o.ors_slimit = SLAP_NO_LIMIT;
 
-	for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
-		LDAPURLDesc	*lud = NULL;
-		int		i, j;
-		struct berval	dn;
-		int		rc;
-
-		BER_BVZERO( &o.o_req_dn );
-		BER_BVZERO( &o.o_req_ndn );
-		o.ors_filter = NULL;
-		o.ors_attrs = NULL;
-		BER_BVZERO( &o.ors_filterstr );
-
-		if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
-			/* FIXME: error? */
-			continue;
+	if ( a->a_nvals ) {
+		for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
+			dynlist_expand_uri( op, rs, dli, &o, url );
 		}
-
-		if ( lud->lud_host != NULL ) {
-			/* FIXME: host not allowed; reject as illegal? */
-			Debug( LDAP_DEBUG_ANY, "dynlist_prepare_entry(\"%s\"): "
-				"illegal URI \"%s\"\n",
-				e->e_name.bv_val, url->bv_val, 0 );
-			goto cleanup;
-		}
-
-		if ( lud->lud_dn == NULL ) {
-			/* note that an empty base is not honored in terms
-			 * of defaultSearchBase, because select_backend()
-			 * is not aware of the defaultSearchBase option;
-			 * this can be useful in case of a database serving
-			 * the empty suffix */
-			BER_BVSTR( &dn, "" );
-
-		} else {
-			ber_str2bv( lud->lud_dn, 0, 0, &dn );
-		}
-		rc = dnPrettyNormal( NULL, &dn, &o.o_req_dn, &o.o_req_ndn, op->o_tmpmemctx );
-		if ( rc != LDAP_SUCCESS ) {
-			/* FIXME: error? */
-			goto cleanup;
-		}
-		o.ors_scope = lud->lud_scope;
-
-		for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-			if ( dlm->dlm_mapped_ad != NULL ) {
-				break;
-			}
-		}
-
-		if ( dli->dli_dlm && !dlm ) {
-			/* if ( lud->lud_attrs != NULL ),
-			 * the URL should be ignored */
-			o.ors_attrs = slap_anlist_no_attrs;
-
-		} else if ( lud->lud_attrs == NULL ) {
-			o.ors_attrs = rs->sr_attrs;
-
-		} else {
-			for ( i = 0; lud->lud_attrs[i]; i++)
-				/* just count */ ;
-
-			o.ors_attrs = op->o_tmpcalloc( i + 1, sizeof( AttributeName ), op->o_tmpmemctx );
-			for ( i = 0, j = 0; lud->lud_attrs[i]; i++) {
-				const char	*text = NULL;
-	
-				ber_str2bv( lud->lud_attrs[i], 0, 0, &o.ors_attrs[j].an_name );
-				o.ors_attrs[j].an_desc = NULL;
-				(void)slap_bv2ad( &o.ors_attrs[j].an_name, &o.ors_attrs[j].an_desc, &text );
-				/* FIXME: ignore errors... */
-
-				if ( rs->sr_attrs == NULL ) {
-					if ( o.ors_attrs[j].an_desc != NULL &&
-							is_at_operational( o.ors_attrs[j].an_desc->ad_type ) )
-					{
-						continue;
-					}
-
-				} else {
-					if ( o.ors_attrs[j].an_desc != NULL &&
-							is_at_operational( o.ors_attrs[j].an_desc->ad_type ) )
-					{
-						if ( !opattrs ) {
-							continue;
-						}
-
-						if ( !ad_inlist( o.ors_attrs[j].an_desc, rs->sr_attrs ) ) {
-							/* lookup if mapped -- linear search,
-							 * not very efficient unless list
-							 * is very short */
-							for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-								if ( dlm->dlm_member_ad == o.ors_attrs[j].an_desc ) {
-									break;
-								}
-							}
-
-							if ( dlm == NULL ) {
-								continue;
-							}
-						}
-
-					} else {
-						if ( !userattrs && 
-								o.ors_attrs[j].an_desc != NULL &&
-								!ad_inlist( o.ors_attrs[j].an_desc, rs->sr_attrs ) )
-						{
-							/* lookup if mapped -- linear search,
-							 * not very efficient unless list
-							 * is very short */
-							for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-								if ( dlm->dlm_member_ad == o.ors_attrs[j].an_desc ) {
-									break;
-								}
-							}
-
-							if ( dlm == NULL ) {
-								continue;
-							}
-						}
-					}
-				}
-
-				j++;
-			}
-
-			if ( j == 0 ) {
-				goto cleanup;
-			}
-		
-			BER_BVZERO( &o.ors_attrs[j].an_name );
-		}
-
-		if ( lud->lud_filter == NULL ) {
-			ber_dupbv_x( &o.ors_filterstr,
-					&dli->dli_default_filter, op->o_tmpmemctx );
-
-		} else {
-			struct berval	flt;
-			ber_str2bv( lud->lud_filter, 0, 0, &flt );
-			if ( dynlist_make_filter( op, rs->sr_entry, url->bv_val, &flt, &o.ors_filterstr ) ) {
-				/* error */
-				goto cleanup;
-			}
-		}
-		o.ors_filter = str2filter_x( op, o.ors_filterstr.bv_val );
-		if ( o.ors_filter == NULL ) {
-			goto cleanup;
-		}
-		
-		o.o_bd = select_backend( &o.o_req_ndn, 1 );
-		if ( o.o_bd && o.o_bd->be_search ) {
-			SlapReply	r = { REP_SEARCH };
-			r.sr_attr_flags = slap_attr_flags( o.ors_attrs );
-			(void)o.o_bd->be_search( &o, &r );
-		}
-
-cleanup:;
-		if ( id ) {
-			slap_op_groups_free( &o );
-		}
-		if ( o.ors_filter ) {
-			filter_free_x( &o, o.ors_filter, 1 );
-		}
-		if ( o.ors_attrs && o.ors_attrs != rs->sr_attrs
-				&& o.ors_attrs != slap_anlist_no_attrs )
-		{
-			op->o_tmpfree( o.ors_attrs, op->o_tmpmemctx );
-		}
-		if ( !BER_BVISNULL( &o.o_req_dn ) ) {
-			op->o_tmpfree( o.o_req_dn.bv_val, op->o_tmpmemctx );
-		}
-		if ( !BER_BVISNULL( &o.o_req_ndn ) ) {
-			op->o_tmpfree( o.o_req_ndn.bv_val, op->o_tmpmemctx );
-		}
-		assert( BER_BVISNULL( &o.ors_filterstr )
-			|| o.ors_filterstr.bv_val != lud->lud_filter );
-		op->o_tmpfree( o.ors_filterstr.bv_val, op->o_tmpmemctx );
-		ldap_free_urldesc( lud );
+	} else if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+		dynlist_expand_uri( op, rs, dli, &o, &dli->dli_default_uri );
 	}
 
 	if ( e != rs->sr_entry ) {
@@ -859,7 +870,7 @@ static ConfigDriver	dl_cfgen;
 
 /* XXXmanu 255 is the maximum arguments we allow. Can we go beyond? */
 static ConfigTable dlcfg[] = {
-	{ "dynlist-attrset", "group-oc> [uri] <URL-ad> <[mapped:]member-ad> [...]",
+	{ "dynlist-attrset", "group-oc> [filter-uri] <URL-ad> [default-uri] <[mapped:]member-ad> [...]",
 		3, 0, 0, ARG_MAGIC|DL_ATTRSET, dl_cfgen,
 		"( OLcfgOvAt:8.1 NAME 'olcDlAttrSet' "
 			"DESC 'Dynamic list: <group objectClass>, <URL attributeDescription>, <member attributeDescription>' "
@@ -883,7 +894,7 @@ static ConfigOCs dlocs[] = {
 		"NAME 'olcDynamicList' "
 		"DESC 'Dynamic list configuration' "
 		"SUP olcOverlayConfig "
-		"MAY olcDLattrSet )",
+		"MAY olcDlAttrSet )",
 		Cft_Overlay, dlcfg, NULL, NULL },
 	{ NULL, 0, NULL }
 };
@@ -912,17 +923,25 @@ dl_cfgen( ConfigArgs *c )
 					SLAP_X_ORDERED_FMT "%s", i,
 					dli->dli_oc->soc_cname.bv_val );
 
-				if ( !BER_BVISNULL( &dli->dli_uri ) ) {
+				if ( !BER_BVISNULL( &dli->dli_ocfilter_uri ) ) {
 					*ptr++ = ' ';
 					*ptr++ = '"';
-					ptr = lutil_strncopy( ptr, dli->dli_uri.bv_val,
-						dli->dli_uri.bv_len );
+					ptr = lutil_strncopy( ptr, dli->dli_ocfilter_uri.bv_val,
+						dli->dli_ocfilter_uri.bv_len );
 					*ptr++ = '"';
 				}
 
 				*ptr++ = ' ';
 				ptr = lutil_strncopy( ptr, dli->dli_ad->ad_cname.bv_val,
 					dli->dli_ad->ad_cname.bv_len );
+
+				if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+					*ptr++ = ' ';
+					*ptr++ = '"';
+					ptr = lutil_strncopy( ptr, dli->dli_default_uri.bv_val,
+						dli->dli_default_uri.bv_len );
+					*ptr++ = '"';
+				}
 
 				for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
 					ptr[ 0 ] = ' ';
@@ -966,20 +985,24 @@ dl_cfgen( ConfigArgs *c )
 
 					dli_next = dli->dli_next;
 
-					if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-						ch_free( dli->dli_uri.bv_val );
+					if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+						ch_free( dli->dli_default_uri.bv_val );
 					}
 
-					if ( dli->dli_lud != NULL ) {
-						ldap_free_urldesc( dli->dli_lud );
+					if ( !BER_BVISNULL( &dli->dli_ocfilter_uri ) ) {
+						ch_free( dli->dli_ocfilter_uri.bv_val );
 					}
 
-					if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-						ber_memfree( dli->dli_uri_nbase.bv_val );
+					if ( dli->dli_ocfilter_lud != NULL ) {
+						ldap_free_urldesc( dli->dli_ocfilter_lud );
 					}
 
-					if ( dli->dli_uri_filter != NULL ) {
-						filter_free( dli->dli_uri_filter );
+					if ( !BER_BVISNULL( &dli->dli_ocfilter_nbase ) ) {
+						ber_memfree( dli->dli_ocfilter_nbase.bv_val );
+					}
+
+					if ( dli->dli_ocfilter_filter != NULL ) {
+						filter_free( dli->dli_ocfilter_filter );
 					}
 
 					ch_free( dli->dli_default_filter.bv_val );
@@ -1011,20 +1034,20 @@ dl_cfgen( ConfigArgs *c )
 				dli = *dlip;
 				*dlip = dli->dli_next;
 
-				if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-					ch_free( dli->dli_uri.bv_val );
+				if ( !BER_BVISNULL( &dli->dli_ocfilter_uri ) ) {
+					ch_free( dli->dli_ocfilter_uri.bv_val );
 				}
 
-				if ( dli->dli_lud != NULL ) {
-					ldap_free_urldesc( dli->dli_lud );
+				if ( dli->dli_ocfilter_lud != NULL ) {
+					ldap_free_urldesc( dli->dli_ocfilter_lud );
 				}
 
-				if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-					ber_memfree( dli->dli_uri_nbase.bv_val );
+				if ( !BER_BVISNULL( &dli->dli_ocfilter_nbase ) ) {
+					ber_memfree( dli->dli_ocfilter_nbase.bv_val );
 				}
 
-				if ( dli->dli_uri_filter != NULL ) {
-					filter_free( dli->dli_uri_filter );
+				if ( dli->dli_ocfilter_filter != NULL ) {
+					filter_free( dli->dli_ocfilter_filter );
 				}
 
 				ch_free( dli->dli_default_filter.bv_val );
@@ -1061,10 +1084,12 @@ dl_cfgen( ConfigArgs *c )
 		ObjectClass		*oc = NULL;
 		AttributeDescription	*ad = NULL;
 		int			attridx = 2;
-		LDAPURLDesc		*lud = NULL;
-		struct berval		nbase = BER_BVNULL;
-		Filter			*filter = NULL;
-		struct berval		uri = BER_BVNULL;
+		LDAPURLDesc		*ocfilter_lud = NULL;
+		struct berval		ocfilter_nbase = BER_BVNULL;
+		Filter			*ocfilter_filter = NULL;
+		struct berval		ocfilter_uri = BER_BVNULL;
+		LDAPURLDesc		*default_lud = NULL;
+		struct berval		default_uri = BER_BVNULL;
 		dynlist_map_t           *dlm = NULL, *dlml = NULL;
 		const char		*text;
 
@@ -1079,7 +1104,7 @@ dl_cfgen( ConfigArgs *c )
 		}
 
 		if ( strncasecmp( c->argv[ attridx ], "ldap://", STRLENOF("ldap://") ) == 0 ) {
-			if ( ldap_url_parse( c->argv[ attridx ], &lud ) != LDAP_URL_SUCCESS ) {
+			if ( ldap_url_parse( c->argv[ attridx ], &ocfilter_lud ) != LDAP_URL_SUCCESS ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"unable to parse URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1087,10 +1112,10 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_host != NULL ) {
-				if ( lud->lud_host[0] == '\0' ) {
-					ch_free( lud->lud_host );
-					lud->lud_host = NULL;
+			if ( ocfilter_lud->lud_host != NULL ) {
+				if ( ocfilter_lud->lud_host[0] == '\0' ) {
+					ch_free( ocfilter_lud->lud_host );
+					ocfilter_lud->lud_host = NULL;
 
 				} else {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
@@ -1101,7 +1126,7 @@ dl_cfgen( ConfigArgs *c )
 				}
 			}
 
-			if ( lud->lud_attrs != NULL ) {
+			if ( ocfilter_lud->lud_attrs != NULL ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"attrs not allowed in URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1109,7 +1134,7 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_exts != NULL ) {
+			if ( ocfilter_lud->lud_exts != NULL ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"extensions not allowed in URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1117,10 +1142,10 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_dn != NULL && lud->lud_dn[ 0 ] != '\0' ) {
+			if ( ocfilter_lud->lud_dn != NULL && ocfilter_lud->lud_dn[ 0 ] != '\0' ) {
 				struct berval dn;
-				ber_str2bv( lud->lud_dn, 0, 0, &dn );
-				rc = dnNormalize( 0, NULL, NULL, &dn, &nbase, NULL );
+				ber_str2bv( ocfilter_lud->lud_dn, 0, 0, &dn );
+				rc = dnNormalize( 0, NULL, NULL, &dn, &ocfilter_nbase, NULL );
 				if ( rc != LDAP_SUCCESS ) {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 						"DN normalization failed in URI \"%s\"",
@@ -1129,9 +1154,9 @@ dl_cfgen( ConfigArgs *c )
 				}
 			}
 
-			if ( lud->lud_filter != NULL && lud->lud_filter[ 0 ] != '\0' ) {
-				filter = str2filter( lud->lud_filter );
-				if ( filter == NULL ) {
+			if ( ocfilter_lud->lud_filter != NULL && ocfilter_lud->lud_filter[ 0 ] != '\0' ) {
+				ocfilter_filter = str2filter( ocfilter_lud->lud_filter );
+				if ( ocfilter_filter == NULL ) {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 						"filter parsing failed in URI \"%s\"",
 						c->argv[ attridx ] );
@@ -1140,20 +1165,20 @@ dl_cfgen( ConfigArgs *c )
 				}
 			}
 
-			ber_str2bv( c->argv[ attridx ], 0, 1, &uri );
+			ber_str2bv( c->argv[ attridx ], 0, 1, &ocfilter_uri );
 
 done_uri:;
 			if ( rc ) {
-				if ( lud ) {
-					ldap_free_urldesc( lud );
+				if ( ocfilter_lud ) {
+					ldap_free_urldesc( ocfilter_lud );
 				}
 
-				if ( !BER_BVISNULL( &nbase ) ) {
-					ber_memfree( nbase.bv_val );
+				if ( !BER_BVISNULL( &ocfilter_nbase ) ) {
+					ber_memfree( ocfilter_nbase.bv_val );
 				}
 
-				if ( filter != NULL ) {
-					filter_free( filter );
+				if ( ocfilter_filter != NULL ) {
+					filter_free( ocfilter_filter );
 				}
 
 				while ( dlm != NULL ) {
@@ -1194,6 +1219,20 @@ done_uri:;
 		}
 
 		attridx++;
+
+		if ( strncasecmp( c->argv[ attridx ], "ldap://", STRLENOF("ldap://") ) == 0 ) {
+			if ( ldap_url_parse( c->argv[ attridx ], &default_lud ) != LDAP_URL_SUCCESS ) {
+				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
+					"unable to parse URI \"%s\"",
+					c->argv[ attridx ] );
+				rc = 1;
+				goto done_uri;
+			} else {
+				ber_str2bv( c->argv[ attridx ], 0, 1, &default_uri );
+			}
+			attridx++;
+		}
+
 
 		for ( i = attridx; i < c->argc; i++ ) {
 			char *arg; 
@@ -1283,10 +1322,12 @@ done_uri:;
 		(*dlip)->dli_dlm = dlm;
 		(*dlip)->dli_next = dli_next;
 
-		(*dlip)->dli_lud = lud;
-		(*dlip)->dli_uri_nbase = nbase;
-		(*dlip)->dli_uri_filter = filter;
-		(*dlip)->dli_uri = uri;
+		(*dlip)->dli_ocfilter_lud = ocfilter_lud;
+		(*dlip)->dli_ocfilter_nbase = ocfilter_nbase;
+		(*dlip)->dli_ocfilter_filter = ocfilter_filter;
+		(*dlip)->dli_ocfilter_uri = ocfilter_uri;
+
+		(*dlip)->dli_default_uri = default_uri;
 
 		rc = dynlist_build_def_filter( *dlip );
 
@@ -1493,20 +1534,24 @@ dynlist_db_destroy(
 
 			dli_next = dli->dli_next;
 
-			if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-				ch_free( dli->dli_uri.bv_val );
+			if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+				ch_free( dli->dli_default_uri.bv_val );
 			}
 
-			if ( dli->dli_lud != NULL ) {
-				ldap_free_urldesc( dli->dli_lud );
+			if ( !BER_BVISNULL( &dli->dli_ocfilter_uri ) ) {
+				ch_free( dli->dli_ocfilter_uri.bv_val );
 			}
 
-			if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-				ber_memfree( dli->dli_uri_nbase.bv_val );
+			if ( dli->dli_ocfilter_lud != NULL ) {
+				ldap_free_urldesc( dli->dli_ocfilter_lud );
 			}
 
-			if ( dli->dli_uri_filter != NULL ) {
-				filter_free( dli->dli_uri_filter );
+			if ( !BER_BVISNULL( &dli->dli_ocfilter_nbase ) ) {
+				ber_memfree( dli->dli_ocfilter_nbase.bv_val );
+			}
+
+			if ( dli->dli_ocfilter_filter != NULL ) {
+				filter_free( dli->dli_ocfilter_filter );
 			}
 
 			ch_free( dli->dli_default_filter.bv_val );
