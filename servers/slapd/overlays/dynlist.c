@@ -1070,10 +1070,10 @@ dl_cfgen( ConfigArgs *c )
 		ObjectClass		*oc = NULL;
 		AttributeDescription	*ad = NULL;
 		int			attridx = 2;
-		LDAPURLDesc		*lud = NULL;
-		struct berval		nbase = BER_BVNULL;
-		Filter			*filter = NULL;
-		struct berval		uri = BER_BVNULL;
+		LDAPURLDesc		*ofilter_lud = NULL;
+		struct berval		ofilter_nbase = BER_BVNULL;
+		Filter			*ofilter_filter = NULL;
+		struct berval		ofilter_uri = BER_BVNULL;
 		dynlist_map_t           *dlm = NULL, *dlml = NULL;
 		const char		*text;
 
@@ -1088,7 +1088,7 @@ dl_cfgen( ConfigArgs *c )
 		}
 
 		if ( strncasecmp( c->argv[ attridx ], "ldap://", STRLENOF("ldap://") ) == 0 ) {
-			if ( ldap_url_parse( c->argv[ attridx ], &lud ) != LDAP_URL_SUCCESS ) {
+			if ( ldap_url_parse( c->argv[ attridx ], &ofilter_lud ) != LDAP_URL_SUCCESS ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"unable to parse URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1096,10 +1096,10 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_host != NULL ) {
-				if ( lud->lud_host[0] == '\0' ) {
-					ch_free( lud->lud_host );
-					lud->lud_host = NULL;
+			if ( ofilter_lud->lud_host != NULL ) {
+				if ( ofilter_lud->lud_host[0] == '\0' ) {
+					ch_free( ofilter_lud->lud_host );
+					ofilter_lud->lud_host = NULL;
 
 				} else {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
@@ -1110,7 +1110,7 @@ dl_cfgen( ConfigArgs *c )
 				}
 			}
 
-			if ( lud->lud_attrs != NULL ) {
+			if ( ofilter_lud->lud_attrs != NULL ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"attrs not allowed in URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1118,7 +1118,7 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_exts != NULL ) {
+			if ( ofilter_lud->lud_exts != NULL ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 					"extensions not allowed in URI \"%s\"",
 					c->argv[ attridx ] );
@@ -1126,10 +1126,10 @@ dl_cfgen( ConfigArgs *c )
 				goto done_uri;
 			}
 
-			if ( lud->lud_dn != NULL && lud->lud_dn[ 0 ] != '\0' ) {
+			if ( ofilter_lud->lud_dn != NULL && ofilter_lud->lud_dn[ 0 ] != '\0' ) {
 				struct berval dn;
-				ber_str2bv( lud->lud_dn, 0, 0, &dn );
-				rc = dnNormalize( 0, NULL, NULL, &dn, &nbase, NULL );
+				ber_str2bv( ofilter_lud->lud_dn, 0, 0, &dn );
+				rc = dnNormalize( 0, NULL, NULL, &dn, &ofilter_nbase, NULL );
 				if ( rc != LDAP_SUCCESS ) {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
 						"DN normalization failed in URI \"%s\"",
@@ -1138,31 +1138,31 @@ dl_cfgen( ConfigArgs *c )
 				}
 			}
 
-			if ( lud->lud_filter != NULL && lud->lud_filter[ 0 ] != '\0' ) {
-				filter = str2filter( lud->lud_filter );
-				if ( filter == NULL ) {
+			if ( ofilter_lud->lud_filter != NULL && ofilter_lud->lud_filter[ 0 ] != '\0' ) {
+				ofilter_filter = str2filter( ofilter_lud->lud_filter );
+				if ( ofilter_filter == NULL ) {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ), DYNLIST_USAGE
-						"filter parsing failed in URI \"%s\"",
+						"ofilter_filter parsing failed in URI \"%s\"",
 						c->argv[ attridx ] );
 					rc = 1;
 					goto done_uri;
 				}
 			}
 
-			ber_str2bv( c->argv[ attridx ], 0, 1, &uri );
+			ber_str2bv( c->argv[ attridx ], 0, 1, &ofilter_uri );
 
 done_uri:;
 			if ( rc ) {
-				if ( lud ) {
-					ldap_free_urldesc( lud );
+				if ( ofilter_lud ) {
+					ldap_free_urldesc( ofilter_lud );
 				}
 
-				if ( !BER_BVISNULL( &nbase ) ) {
-					ber_memfree( nbase.bv_val );
+				if ( !BER_BVISNULL( &ofilter_nbase ) ) {
+					ber_memfree( ofilter_nbase.bv_val );
 				}
 
-				if ( filter != NULL ) {
-					filter_free( filter );
+				if ( ofilter_filter != NULL ) {
+					filter_free( ofilter_filter );
 				}
 
 				while ( dlm != NULL ) {
@@ -1292,10 +1292,10 @@ done_uri:;
 		(*dlip)->dli_dlm = dlm;
 		(*dlip)->dli_next = dli_next;
 
-		(*dlip)->dli_ofilter_lud = lud;
-		(*dlip)->dli_ofilter_nbase = nbase;
-		(*dlip)->dli_ofilter_filter = filter;
-		(*dlip)->dli_ofilter_uri = uri;
+		(*dlip)->dli_ofilter_lud = ofilter_lud;
+		(*dlip)->dli_ofilter_nbase = ofilter_nbase;
+		(*dlip)->dli_ofilter_filter = ofilter_filter;
+		(*dlip)->dli_ofilter_uri = ofilter_uri;
 
 		rc = dynlist_build_def_filter( *dlip );
 
