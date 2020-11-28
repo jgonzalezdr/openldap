@@ -341,7 +341,191 @@ done:;
 
 	return 0;
 }
+
+static void
+dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, Entry *e, Attribute *id, struct berval *url )
+{
+	dynlist_map_t	*dlm;
+	LDAPURLDesc	*lud = NULL;
+	int		i, j;
+	struct berval	dn;
+	int		rc;
+	int		opattrs,
+			userattrs;
+
+	BER_BVZERO( &(o->o_req_dn) );
+	BER_BVZERO( &(o->o_req_ndn) );
+	o->ors_filter = NULL;
+	o->ors_attrs = NULL;
+	BER_BVZERO( &(o->ors_filterstr) );
+
+	if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
+		/* FIXME: error? */
+		return;
+	}
+
+	if ( lud->lud_host != NULL ) {
+		/* FIXME: host not allowed; reject as illegal? */
+		Debug( LDAP_DEBUG_ANY, "dynlist_prepare_entry(\"%s\"): "
+			"illegal URI \"%s\"\n",
+			e->e_name.bv_val, url->bv_val, 0 );
+		goto cleanup;
+	}
+
+	if ( lud->lud_dn == NULL ) {
+		/* note that an empty base is not honored in terms
+			* of defaultSearchBase, because select_backend()
+			* is not aware of the defaultSearchBase option;
+			* this can be useful in case of a database serving
+			* the empty suffix */
+		BER_BVSTR( &dn, "" );
+
+	} else {
+		ber_str2bv( lud->lud_dn, 0, 0, &dn );
+	}
+	rc = dnPrettyNormal( NULL, &dn, &(o->o_req_dn), &(o->o_req_ndn), op->o_tmpmemctx );
+	if ( rc != LDAP_SUCCESS ) {
+		/* FIXME: error? */
+		goto cleanup;
+	}
+	o->ors_scope = lud->lud_scope;
+
+	for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+		if ( dlm->dlm_mapped_ad != NULL ) {
+			break;
+		}
+	}
+
+	if ( dli->dli_dlm && !dlm ) {
+		/* if ( lud->lud_attrs != NULL ),
+			* the URL should be ignored */
+		o->ors_attrs = slap_anlist_no_attrs;
+
+	} else if ( lud->lud_attrs == NULL ) {
+		o->ors_attrs = rs->sr_attrs;
+
+	} else {
+		for ( i = 0; lud->lud_attrs[i]; i++)
+			/* just count */ ;
+
+		o->ors_attrs = op->o_tmpcalloc( i + 1, sizeof( AttributeName ), op->o_tmpmemctx );
+		for ( i = 0, j = 0; lud->lud_attrs[i]; i++) {
+			const char	*text = NULL;
+
+			ber_str2bv( lud->lud_attrs[i], 0, 0, &(o->ors_attrs[j].an_name) );
+			o->ors_attrs[j].an_desc = NULL;
+			(void)slap_bv2ad( &(o->ors_attrs[j].an_name), &(o->ors_attrs[j].an_desc), &text );
+			/* FIXME: ignore errors... */
+
+			if ( rs->sr_attrs == NULL ) {
+				if ( o->ors_attrs[j].an_desc != NULL &&
+						is_at_operational( o->ors_attrs[j].an_desc->ad_type ) )
+				{
+					continue;
+				}
+
+			} else {
+				if ( o->ors_attrs[j].an_desc != NULL &&
+						is_at_operational( o->ors_attrs[j].an_desc->ad_type ) )
+				{
+					if ( !opattrs ) {
+						continue;
+					}
+
+					if ( !ad_inlist( o->ors_attrs[j].an_desc, rs->sr_attrs ) ) {
+						/* lookup if mapped -- linear search,
+							* not very efficient unless list
+							* is very short */
+						for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+							if ( dlm->dlm_member_ad == o->ors_attrs[j].an_desc ) {
+								break;
+							}
+						}
+
+						if ( dlm == NULL ) {
+							continue;
+						}
+					}
+
+				} else {
+					if ( !userattrs && 
+							o->ors_attrs[j].an_desc != NULL &&
+							!ad_inlist( o->ors_attrs[j].an_desc, rs->sr_attrs ) )
+					{
+						/* lookup if mapped -- linear search,
+							* not very efficient unless list
+							* is very short */
+						for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
+							if ( dlm->dlm_member_ad == o->ors_attrs[j].an_desc ) {
+								break;
+							}
+						}
+
+						if ( dlm == NULL ) {
+							continue;
+						}
+					}
+				}
+			}
+
+			j++;
+		}
+
+		if ( j == 0 ) {
+			goto cleanup;
+		}
 	
+		BER_BVZERO( &(o->ors_attrs[j].an_name) );
+	}
+
+	if ( lud->lud_filter == NULL ) {
+		ber_dupbv_x( &(o->ors_filterstr),
+				&dli->dli_default_filter, op->o_tmpmemctx );
+
+	} else {
+		struct berval	flt;
+		ber_str2bv( lud->lud_filter, 0, 0, &flt );
+		if ( dynlist_make_filter( op, rs->sr_entry, url->bv_val, &flt, &(o->ors_filterstr) ) ) {
+			/* error */
+			goto cleanup;
+		}
+	}
+	o->ors_filter = str2filter_x( op, o->ors_filterstr.bv_val );
+	if ( o->ors_filter == NULL ) {
+		goto cleanup;
+	}
+	
+	o->o_bd = select_backend( &(o->o_req_ndn), 1 );
+	if ( o->o_bd && o->o_bd->be_search ) {
+		SlapReply	r = { REP_SEARCH };
+		r.sr_attr_flags = slap_attr_flags( o->ors_attrs );
+		(void)o->o_bd->be_search( o, &r );
+	}
+
+cleanup:;
+	if ( id ) {
+		slap_op_groups_free( o );
+	}
+	if ( o->ors_filter ) {
+		filter_free_x( o, o->ors_filter, 1 );
+	}
+	if ( o->ors_attrs && o->ors_attrs != rs->sr_attrs
+			&& o->ors_attrs != slap_anlist_no_attrs )
+	{
+		op->o_tmpfree( o->ors_attrs, op->o_tmpmemctx );
+	}
+	if ( !BER_BVISNULL( &(o->o_req_dn) ) ) {
+		op->o_tmpfree( o->o_req_dn.bv_val, op->o_tmpmemctx );
+	}
+	if ( !BER_BVISNULL( &(o->o_req_ndn) ) ) {
+		op->o_tmpfree( o->o_req_ndn.bv_val, op->o_tmpmemctx );
+	}
+	assert( BER_BVISNULL( &(o->ors_filterstr) )
+		|| o->ors_filterstr.bv_val != lud->lud_filter );
+	op->o_tmpfree( o->ors_filterstr.bv_val, op->o_tmpmemctx );
+	ldap_free_urldesc( lud );
+}
+
 static int
 dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 {
@@ -412,182 +596,7 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 	o.ors_slimit = SLAP_NO_LIMIT;
 
 	for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
-		LDAPURLDesc	*lud = NULL;
-		int		i, j;
-		struct berval	dn;
-		int		rc;
-
-		BER_BVZERO( &o.o_req_dn );
-		BER_BVZERO( &o.o_req_ndn );
-		o.ors_filter = NULL;
-		o.ors_attrs = NULL;
-		BER_BVZERO( &o.ors_filterstr );
-
-		if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
-			/* FIXME: error? */
-			continue;
-		}
-
-		if ( lud->lud_host != NULL ) {
-			/* FIXME: host not allowed; reject as illegal? */
-			Debug( LDAP_DEBUG_ANY, "dynlist_prepare_entry(\"%s\"): "
-				"illegal URI \"%s\"\n",
-				e->e_name.bv_val, url->bv_val, 0 );
-			goto cleanup;
-		}
-
-		if ( lud->lud_dn == NULL ) {
-			/* note that an empty base is not honored in terms
-			 * of defaultSearchBase, because select_backend()
-			 * is not aware of the defaultSearchBase option;
-			 * this can be useful in case of a database serving
-			 * the empty suffix */
-			BER_BVSTR( &dn, "" );
-
-		} else {
-			ber_str2bv( lud->lud_dn, 0, 0, &dn );
-		}
-		rc = dnPrettyNormal( NULL, &dn, &o.o_req_dn, &o.o_req_ndn, op->o_tmpmemctx );
-		if ( rc != LDAP_SUCCESS ) {
-			/* FIXME: error? */
-			goto cleanup;
-		}
-		o.ors_scope = lud->lud_scope;
-
-		for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-			if ( dlm->dlm_mapped_ad != NULL ) {
-				break;
-			}
-		}
-
-		if ( dli->dli_dlm && !dlm ) {
-			/* if ( lud->lud_attrs != NULL ),
-			 * the URL should be ignored */
-			o.ors_attrs = slap_anlist_no_attrs;
-
-		} else if ( lud->lud_attrs == NULL ) {
-			o.ors_attrs = rs->sr_attrs;
-
-		} else {
-			for ( i = 0; lud->lud_attrs[i]; i++)
-				/* just count */ ;
-
-			o.ors_attrs = op->o_tmpcalloc( i + 1, sizeof( AttributeName ), op->o_tmpmemctx );
-			for ( i = 0, j = 0; lud->lud_attrs[i]; i++) {
-				const char	*text = NULL;
-	
-				ber_str2bv( lud->lud_attrs[i], 0, 0, &o.ors_attrs[j].an_name );
-				o.ors_attrs[j].an_desc = NULL;
-				(void)slap_bv2ad( &o.ors_attrs[j].an_name, &o.ors_attrs[j].an_desc, &text );
-				/* FIXME: ignore errors... */
-
-				if ( rs->sr_attrs == NULL ) {
-					if ( o.ors_attrs[j].an_desc != NULL &&
-							is_at_operational( o.ors_attrs[j].an_desc->ad_type ) )
-					{
-						continue;
-					}
-
-				} else {
-					if ( o.ors_attrs[j].an_desc != NULL &&
-							is_at_operational( o.ors_attrs[j].an_desc->ad_type ) )
-					{
-						if ( !opattrs ) {
-							continue;
-						}
-
-						if ( !ad_inlist( o.ors_attrs[j].an_desc, rs->sr_attrs ) ) {
-							/* lookup if mapped -- linear search,
-							 * not very efficient unless list
-							 * is very short */
-							for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-								if ( dlm->dlm_member_ad == o.ors_attrs[j].an_desc ) {
-									break;
-								}
-							}
-
-							if ( dlm == NULL ) {
-								continue;
-							}
-						}
-
-					} else {
-						if ( !userattrs && 
-								o.ors_attrs[j].an_desc != NULL &&
-								!ad_inlist( o.ors_attrs[j].an_desc, rs->sr_attrs ) )
-						{
-							/* lookup if mapped -- linear search,
-							 * not very efficient unless list
-							 * is very short */
-							for ( dlm = dli->dli_dlm; dlm; dlm = dlm->dlm_next ) {
-								if ( dlm->dlm_member_ad == o.ors_attrs[j].an_desc ) {
-									break;
-								}
-							}
-
-							if ( dlm == NULL ) {
-								continue;
-							}
-						}
-					}
-				}
-
-				j++;
-			}
-
-			if ( j == 0 ) {
-				goto cleanup;
-			}
-		
-			BER_BVZERO( &o.ors_attrs[j].an_name );
-		}
-
-		if ( lud->lud_filter == NULL ) {
-			ber_dupbv_x( &o.ors_filterstr,
-					&dli->dli_default_filter, op->o_tmpmemctx );
-
-		} else {
-			struct berval	flt;
-			ber_str2bv( lud->lud_filter, 0, 0, &flt );
-			if ( dynlist_make_filter( op, rs->sr_entry, url->bv_val, &flt, &o.ors_filterstr ) ) {
-				/* error */
-				goto cleanup;
-			}
-		}
-		o.ors_filter = str2filter_x( op, o.ors_filterstr.bv_val );
-		if ( o.ors_filter == NULL ) {
-			goto cleanup;
-		}
-		
-		o.o_bd = select_backend( &o.o_req_ndn, 1 );
-		if ( o.o_bd && o.o_bd->be_search ) {
-			SlapReply	r = { REP_SEARCH };
-			r.sr_attr_flags = slap_attr_flags( o.ors_attrs );
-			(void)o.o_bd->be_search( &o, &r );
-		}
-
-cleanup:;
-		if ( id ) {
-			slap_op_groups_free( &o );
-		}
-		if ( o.ors_filter ) {
-			filter_free_x( &o, o.ors_filter, 1 );
-		}
-		if ( o.ors_attrs && o.ors_attrs != rs->sr_attrs
-				&& o.ors_attrs != slap_anlist_no_attrs )
-		{
-			op->o_tmpfree( o.ors_attrs, op->o_tmpmemctx );
-		}
-		if ( !BER_BVISNULL( &o.o_req_dn ) ) {
-			op->o_tmpfree( o.o_req_dn.bv_val, op->o_tmpmemctx );
-		}
-		if ( !BER_BVISNULL( &o.o_req_ndn ) ) {
-			op->o_tmpfree( o.o_req_ndn.bv_val, op->o_tmpmemctx );
-		}
-		assert( BER_BVISNULL( &o.ors_filterstr )
-			|| o.ors_filterstr.bv_val != lud->lud_filter );
-		op->o_tmpfree( o.ors_filterstr.bv_val, op->o_tmpmemctx );
-		ldap_free_urldesc( lud );
+		dynlist_expand_uri( op, rs, dli, &o, e, id, url );
 	}
 
 	if ( e != rs->sr_entry ) {
