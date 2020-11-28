@@ -48,10 +48,10 @@ typedef struct dynlist_info_t {
 	ObjectClass		*dli_oc;
 	AttributeDescription	*dli_ad;
 	struct dynlist_map_t	*dli_dlm;
-	struct berval		dli_uri;
-	LDAPURLDesc		*dli_lud;
-	struct berval		dli_uri_nbase;
-	Filter			*dli_uri_filter;
+	struct berval		dli_ofilter_uri;
+	LDAPURLDesc		*dli_ofilter_lud;
+	struct berval		dli_ofilter_nbase;
+	Filter			*dli_ofilter_filter;
 	struct berval		dli_default_filter;
 	struct dynlist_info_t	*dli_next;
 } dynlist_info_t;
@@ -83,18 +83,18 @@ dynlist_is_dynlist_next( Operation *op, SlapReply *rs, dynlist_info_t *old_dli )
 	}
 
 	for ( ; dli; dli = dli->dli_next ) {
-		if ( dli->dli_lud != NULL ) {
+		if ( dli->dli_ofilter_lud != NULL ) {
 			/* check base and scope */
-			if ( !BER_BVISNULL( &dli->dli_uri_nbase )
+			if ( !BER_BVISNULL( &dli->dli_ofilter_nbase )
 				&& !dnIsSuffixScope( &rs->sr_entry->e_nname,
-					&dli->dli_uri_nbase,
-					dli->dli_lud->lud_scope ) )
+					&dli->dli_ofilter_nbase,
+					dli->dli_ofilter_lud->lud_scope ) )
 			{
 				continue;
 			}
 
 			/* check filter */
-			if ( dli->dli_uri_filter && test_filter( op, rs->sr_entry, dli->dli_uri_filter ) != LDAP_COMPARE_TRUE ) {
+			if ( dli->dli_ofilter_filter && test_filter( op, rs->sr_entry, dli->dli_ofilter_filter ) != LDAP_COMPARE_TRUE ) {
 				continue;
 			}
 		}
@@ -921,11 +921,11 @@ dl_cfgen( ConfigArgs *c )
 					SLAP_X_ORDERED_FMT "%s", i,
 					dli->dli_oc->soc_cname.bv_val );
 
-				if ( !BER_BVISNULL( &dli->dli_uri ) ) {
+				if ( !BER_BVISNULL( &dli->dli_ofilter_uri ) ) {
 					*ptr++ = ' ';
 					*ptr++ = '"';
-					ptr = lutil_strncopy( ptr, dli->dli_uri.bv_val,
-						dli->dli_uri.bv_len );
+					ptr = lutil_strncopy( ptr, dli->dli_ofilter_uri.bv_val,
+						dli->dli_ofilter_uri.bv_len );
 					*ptr++ = '"';
 				}
 
@@ -975,20 +975,20 @@ dl_cfgen( ConfigArgs *c )
 
 					dli_next = dli->dli_next;
 
-					if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-						ch_free( dli->dli_uri.bv_val );
+					if ( !BER_BVISNULL( &dli->dli_ofilter_uri ) ) {
+						ch_free( dli->dli_ofilter_uri.bv_val );
 					}
 
-					if ( dli->dli_lud != NULL ) {
-						ldap_free_urldesc( dli->dli_lud );
+					if ( dli->dli_ofilter_lud != NULL ) {
+						ldap_free_urldesc( dli->dli_ofilter_lud );
 					}
 
-					if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-						ber_memfree( dli->dli_uri_nbase.bv_val );
+					if ( !BER_BVISNULL( &dli->dli_ofilter_nbase ) ) {
+						ber_memfree( dli->dli_ofilter_nbase.bv_val );
 					}
 
-					if ( dli->dli_uri_filter != NULL ) {
-						filter_free( dli->dli_uri_filter );
+					if ( dli->dli_ofilter_filter != NULL ) {
+						filter_free( dli->dli_ofilter_filter );
 					}
 
 					ch_free( dli->dli_default_filter.bv_val );
@@ -1020,20 +1020,20 @@ dl_cfgen( ConfigArgs *c )
 				dli = *dlip;
 				*dlip = dli->dli_next;
 
-				if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-					ch_free( dli->dli_uri.bv_val );
+				if ( !BER_BVISNULL( &dli->dli_ofilter_uri ) ) {
+					ch_free( dli->dli_ofilter_uri.bv_val );
 				}
 
-				if ( dli->dli_lud != NULL ) {
-					ldap_free_urldesc( dli->dli_lud );
+				if ( dli->dli_ofilter_lud != NULL ) {
+					ldap_free_urldesc( dli->dli_ofilter_lud );
 				}
 
-				if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-					ber_memfree( dli->dli_uri_nbase.bv_val );
+				if ( !BER_BVISNULL( &dli->dli_ofilter_nbase ) ) {
+					ber_memfree( dli->dli_ofilter_nbase.bv_val );
 				}
 
-				if ( dli->dli_uri_filter != NULL ) {
-					filter_free( dli->dli_uri_filter );
+				if ( dli->dli_ofilter_filter != NULL ) {
+					filter_free( dli->dli_ofilter_filter );
 				}
 
 				ch_free( dli->dli_default_filter.bv_val );
@@ -1292,10 +1292,10 @@ done_uri:;
 		(*dlip)->dli_dlm = dlm;
 		(*dlip)->dli_next = dli_next;
 
-		(*dlip)->dli_lud = lud;
-		(*dlip)->dli_uri_nbase = nbase;
-		(*dlip)->dli_uri_filter = filter;
-		(*dlip)->dli_uri = uri;
+		(*dlip)->dli_ofilter_lud = lud;
+		(*dlip)->dli_ofilter_nbase = nbase;
+		(*dlip)->dli_ofilter_filter = filter;
+		(*dlip)->dli_ofilter_uri = uri;
 
 		rc = dynlist_build_def_filter( *dlip );
 
@@ -1502,20 +1502,20 @@ dynlist_db_destroy(
 
 			dli_next = dli->dli_next;
 
-			if ( !BER_BVISNULL( &dli->dli_uri ) ) {
-				ch_free( dli->dli_uri.bv_val );
+			if ( !BER_BVISNULL( &dli->dli_ofilter_uri ) ) {
+				ch_free( dli->dli_ofilter_uri.bv_val );
 			}
 
-			if ( dli->dli_lud != NULL ) {
-				ldap_free_urldesc( dli->dli_lud );
+			if ( dli->dli_ofilter_lud != NULL ) {
+				ldap_free_urldesc( dli->dli_ofilter_lud );
 			}
 
-			if ( !BER_BVISNULL( &dli->dli_uri_nbase ) ) {
-				ber_memfree( dli->dli_uri_nbase.bv_val );
+			if ( !BER_BVISNULL( &dli->dli_ofilter_nbase ) ) {
+				ber_memfree( dli->dli_ofilter_nbase.bv_val );
 			}
 
-			if ( dli->dli_uri_filter != NULL ) {
-				filter_free( dli->dli_uri_filter );
+			if ( dli->dli_ofilter_filter != NULL ) {
+				filter_free( dli->dli_ofilter_filter );
 			}
 
 			ch_free( dli->dli_default_filter.bv_val );
