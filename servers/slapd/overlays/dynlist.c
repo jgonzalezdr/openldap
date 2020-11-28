@@ -47,6 +47,7 @@ typedef struct dynlist_map_t {
 typedef struct dynlist_info_t {
 	ObjectClass		*dli_oc;
 	AttributeDescription	*dli_ad;
+	struct berval		dli_default_uri;
 	struct dynlist_map_t	*dli_dlm;
 	struct berval		dli_ofilter_uri;
 	LDAPURLDesc		*dli_ofilter_lud;
@@ -57,7 +58,7 @@ typedef struct dynlist_info_t {
 } dynlist_info_t;
 
 #define DYNLIST_USAGE \
-	"\"dynlist-attrset <oc> [uri] <URL-ad> [[<mapped-ad>:]<member-ad> ...]\": "
+	"\"dynlist-attrset <oc> [filter-uri] <URL-ad> [default-uri] [[<mapped-ad>:]<member-ad> ...]\": "
 
 static dynlist_info_t *
 dynlist_is_dynlist_next( Operation *op, SlapReply *rs, dynlist_info_t *old_dli )
@@ -540,8 +541,8 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 	dynlist_map_t	*dlm;
 
 	a = attrs_find( rs->sr_entry->e_attrs, dli->dli_ad );
-	if ( a == NULL ) {
-		/* FIXME: error? */
+	if ( ( a == NULL ) && BER_BVISNULL( &(dli->dli_default_uri) ) ) {
+		/* Ignore this entry */
 		return SLAP_CB_CONTINUE;
 	}
 
@@ -595,8 +596,13 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 	o.ors_tlimit = SLAP_NO_LIMIT;
 	o.ors_slimit = SLAP_NO_LIMIT;
 
-	for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
-		dynlist_expand_uri( op, rs, dli, &o, e, id, url );
+	if( a != NULL )
+	{
+		for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
+			dynlist_expand_uri( op, rs, dli, &o, e, id, url );
+		}
+	} else {
+		dynlist_expand_uri( op, rs, dli, &o, e, id, &(dli->dli_default_uri) );
 	}
 
 	if ( e != rs->sr_entry ) {
@@ -868,7 +874,7 @@ static ConfigDriver	dl_cfgen;
 
 /* XXXmanu 255 is the maximum arguments we allow. Can we go beyond? */
 static ConfigTable dlcfg[] = {
-	{ "dynlist-attrset", "group-oc> [uri] <URL-ad> <[mapped:]member-ad> [...]",
+	{ "dynlist-attrset", "group-oc> [filter-uri] <URL-ad> [default-uri] <[mapped:]member-ad> [...]",
 		3, 0, 0, ARG_MAGIC|DL_ATTRSET, dl_cfgen,
 		"( OLcfgOvAt:8.1 NAME 'olcDlAttrSet' "
 			"DESC 'Dynamic list: <group objectClass>, <URL attributeDescription>, <member attributeDescription>' "
@@ -991,6 +997,10 @@ dl_cfgen( ConfigArgs *c )
 						filter_free( dli->dli_ofilter_filter );
 					}
 
+					if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+						ch_free( dli->dli_default_uri.bv_val );
+					}
+
 					ch_free( dli->dli_default_filter.bv_val );
 
 					while ( dlm != NULL ) {
@@ -1036,6 +1046,10 @@ dl_cfgen( ConfigArgs *c )
 					filter_free( dli->dli_ofilter_filter );
 				}
 
+				if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+					ch_free( dli->dli_default_uri.bv_val );
+				}
+
 				ch_free( dli->dli_default_filter.bv_val );
 
 				dlm = dli->dli_dlm;
@@ -1074,6 +1088,7 @@ dl_cfgen( ConfigArgs *c )
 		struct berval		ofilter_nbase = BER_BVNULL;
 		Filter			*ofilter_filter = NULL;
 		struct berval		ofilter_uri = BER_BVNULL;
+		struct berval		default_uri = BER_BVNULL;
 		dynlist_map_t           *dlm = NULL, *dlml = NULL;
 		const char		*text;
 
@@ -1204,6 +1219,12 @@ done_uri:;
 
 		attridx++;
 
+		if ( ( attridx < c->argc ) &&
+		     ( strncasecmp( c->argv[ attridx ], "ldap://", STRLENOF("ldap://") ) == 0 ) ) {
+			ber_str2bv( c->argv[ attridx ], 0, 1, &default_uri );
+			attridx++;
+		}
+
 		for ( i = attridx; i < c->argc; i++ ) {
 			char *arg; 
 			char *cp;
@@ -1296,6 +1317,8 @@ done_uri:;
 		(*dlip)->dli_ofilter_nbase = ofilter_nbase;
 		(*dlip)->dli_ofilter_filter = ofilter_filter;
 		(*dlip)->dli_ofilter_uri = ofilter_uri;
+
+		(*dlip)->dli_default_uri = default_uri;
 
 		rc = dynlist_build_def_filter( *dlip );
 
@@ -1516,6 +1539,10 @@ dynlist_db_destroy(
 
 			if ( dli->dli_ofilter_filter != NULL ) {
 				filter_free( dli->dli_ofilter_filter );
+			}
+
+			if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
+				ch_free( dli->dli_default_uri.bv_val );
 			}
 
 			ch_free( dli->dli_default_filter.bv_val );
