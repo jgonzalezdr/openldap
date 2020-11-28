@@ -366,7 +366,7 @@ dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation
 
 	if ( lud->lud_host != NULL ) {
 		/* FIXME: host not allowed; reject as illegal? */
-		Debug( LDAP_DEBUG_ANY, "dynlist_prepare_entry(\"%s\"): "
+		Debug( LDAP_DEBUG_ANY, "dynlist_expand_uri(\"%s\"): "
 			"illegal URI \"%s\"\n",
 			e->e_name.bv_val, url->bv_val, 0 );
 		goto cleanup;
