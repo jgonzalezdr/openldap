@@ -344,18 +344,24 @@ done:;
 }
 
 static void
-dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, struct berval *url )
+dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, Entry *e, Attribute *id, struct berval *url )
 {
+	dynlist_map_t	*dlm;
 	LDAPURLDesc	*lud = NULL;
 	int		i, j;
 	struct berval	dn;
 	int		rc;
+	int		opattrs,
+			userattrs;
 
 	BER_BVZERO( &o->o_req_dn );
 	BER_BVZERO( &o->o_req_ndn );
 	o->ors_filter = NULL;
 	o->ors_attrs = NULL;
 	BER_BVZERO( &o->ors_filterstr );
+
+	opattrs = SLAP_OPATTRS( rs->sr_attr_flags );
+	userattrs = SLAP_USERATTRS( rs->sr_attr_flags );
 
 	if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
 		/* FIXME: error? */
@@ -497,15 +503,15 @@ dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation
 	if ( o->o_bd && o->o_bd->be_search ) {
 		SlapReply	r = { REP_SEARCH };
 		r.sr_attr_flags = slap_attr_flags( o->ors_attrs );
-		(void)o->o_bd->be_search( &o, &r );
+		(void)o->o_bd->be_search( o, &r );
 	}
 
 cleanup:;
 	if ( id ) {
-		slap_op_groups_free( &o );
+		slap_op_groups_free( o );
 	}
 	if ( o->ors_filter ) {
-		filter_free_x( &o, o->ors_filter, 1 );
+		filter_free_x( o, o->ors_filter, 1 );
 	}
 	if ( o->ors_attrs && o->ors_attrs != rs->sr_attrs
 			&& o->ors_attrs != slap_anlist_no_attrs )
@@ -532,8 +538,7 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 	Operation	o = *op;
 	struct berval	*url;
 	Entry		*e;
-	int		opattrs,
-			userattrs;
+	int		userattrs;
 	dynlist_sc_t	dlc = { 0 };
 	dynlist_map_t	*dlm;
 
@@ -543,7 +548,6 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 		return SLAP_CB_CONTINUE;
 	}
 
-	opattrs = SLAP_OPATTRS( rs->sr_attr_flags );
 	userattrs = SLAP_USERATTRS( rs->sr_attr_flags );
 
 	/* Don't generate member list if it wasn't requested */
@@ -595,10 +599,10 @@ dynlist_prepare_entry( Operation *op, SlapReply *rs, dynlist_info_t *dli )
 
 	if ( a->a_nvals ) {
 		for ( url = a->a_nvals; !BER_BVISNULL( url ); url++ ) {
-			dynlist_expand_uri( op, rs, dli, &o, url );
+			dynlist_expand_uri( op, rs, dli, &o, e, id, url );
 		}
 	} else if ( !BER_BVISNULL( &dli->dli_default_uri ) ) {
-		dynlist_expand_uri( op, rs, dli, &o, &dli->dli_default_uri );
+		dynlist_expand_uri( op, rs, dli, &o, e, id, &dli->dli_default_uri );
 	}
 
 	if ( e != rs->sr_entry ) {
