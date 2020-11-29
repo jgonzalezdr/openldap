@@ -711,7 +711,9 @@ dynlist_compare( Operation *op, SlapReply *rs )
 done:;
 			if ( id ) ber_bvarray_free_x( id, o.o_tmpmemctx );
 
-			return SLAP_CB_CONTINUE;
+			if ( ( rs->sr_err == LDAP_COMPARE_TRUE ) || BER_BVISNULL( &(dli->dli_default_uri) ) ) {
+				return SLAP_CB_CONTINUE;
+			}
 		}
 	}
 
