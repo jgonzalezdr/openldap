@@ -343,8 +343,75 @@ done:;
 	return 0;
 }
 
+static struct berval *
+dynlist_expand_variables( Operation *op, SlapReply *rs, struct berval *url )
+{
+	struct berval *expanded_url;
+	int i;
+	char **url_parts;
+
+	url_parts = ldap_str2charray( url->bv_val, "@" );
+	if ( url_parts == NULL ) {
+		return NULL;
+	}
+
+	i = 0;
+	while ( url_parts[i] ) {
+		size_t part_len = strlen( url_parts[i] );
+
+		if( url_parts[i][part_len - 1] == '\\' ) {
+			/* Escape delimiter */
+			url_parts[i][part_len - 1] = '@';
+			i++;
+			continue;
+		}
+
+		/* Skip part before variable */
+		i++;
+
+		/* Replace variable name with attribute value (if it exists) */
+		if ( url_parts[i] ) {
+			char *replacement_value = NULL;
+
+			if ( strcmp( url_parts[i], "dn" ) == 0 ) {
+				replacement_value = SLAP_STRDUP( rs->sr_entry->e_nname.bv_val );
+			} else {
+				Attribute *attribute = rs->sr_entry->e_attrs;
+				for ( ; attribute != NULL; attribute = attribute->a_next ) {
+					if ( strcmp( attribute->a_desc->ad_cname.bv_val, url_parts[i] ) == 0 ) {
+						break;
+					}
+				}
+				if ( ( attribute != NULL ) && !BER_BVISNULL( attribute->a_nvals ) ) {
+					replacement_value = SLAP_STRDUP( attribute->a_nvals->bv_val );
+				} else {
+					Debug( LDAP_DEBUG_ANY, "dynlist_expand_variables: Attribute \"%s\" not found (%p).\n",
+						url_parts[i], attribute, 0 );
+					ldap_charray_free( url_parts );
+					return NULL;
+				}
+			}
+
+			if( replacement_value != NULL ) {
+				SLAP_FREE( url_parts[i] );
+				url_parts[i] = replacement_value;
+			}
+
+			i++;
+		}
+	}
+
+	expanded_url = op->o_tmpalloc( sizeof( struct berval ), op->o_tmpmemctx );
+
+	expanded_url->bv_val = ldap_charray2str( url_parts, "" );
+
+	ldap_charray_free( url_parts );
+
+	return expanded_url;
+}
+
 static void
-dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, Entry *e, Attribute *id, struct berval *url )
+dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation *o, Entry *e, Attribute *id, struct berval *passed_url )
 {
 	dynlist_map_t	*dlm;
 	LDAPURLDesc	*lud = NULL;
@@ -360,9 +427,14 @@ dynlist_expand_uri( Operation *op, SlapReply *rs, dynlist_info_t *dli, Operation
 	o->ors_attrs = NULL;
 	BER_BVZERO( &(o->ors_filterstr) );
 
+	struct berval *url = dynlist_expand_variables( op, rs, passed_url );
+	if( !url ) {
+		return;
+	}
+
 	if ( ldap_url_parse( url->bv_val, &lud ) != LDAP_URL_SUCCESS ) {
 		/* FIXME: error? */
-		return;
+		goto cleanup;
 	}
 
 	if ( lud->lud_host != NULL ) {
@@ -521,10 +593,14 @@ cleanup:;
 	if ( !BER_BVISNULL( &(o->o_req_ndn) ) ) {
 		op->o_tmpfree( o->o_req_ndn.bv_val, op->o_tmpmemctx );
 	}
-	assert( BER_BVISNULL( &(o->ors_filterstr) )
-		|| o->ors_filterstr.bv_val != lud->lud_filter );
-	op->o_tmpfree( o->ors_filterstr.bv_val, op->o_tmpmemctx );
-	ldap_free_urldesc( lud );
+	if ( lud ) {
+		assert( BER_BVISNULL( &(o->ors_filterstr) )
+			|| o->ors_filterstr.bv_val != lud->lud_filter );
+		op->o_tmpfree( o->ors_filterstr.bv_val, op->o_tmpmemctx );
+		ldap_free_urldesc( lud );
+	}
+	SLAP_FREE( url->bv_val );
+	op->o_tmpfree( url, op->o_tmpmemctx );
 }
 
 static int

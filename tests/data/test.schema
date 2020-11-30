@@ -58,6 +58,20 @@ attributetype ( 1.3.6.1.4.1.4203.1.12.1.1.6
 	syntax 1.3.6.1.4.1.1466.115.121.1.7
 	single-value )
 
+# for dynlist testing
+attributetype ( 1.3.6.1.4.1.4203.1.12.1.1.7
+	name 'memberOfGroup'
+	desc 'Group that the entry belongs to'
+	equality distinguishedNameMatch
+	syntax 1.3.6.1.4.1.1466.115.121.1.12 )
+
+# for dynlist testing
+attributetype ( 1.3.6.1.4.1.4203.1.12.1.1.8
+	name 'memberOfPosixGroup'
+	desc 'Group that the entry belongs to'
+	equality distinguishedNameMatch
+	syntax 1.3.6.1.4.1.1466.115.121.1.12 )
+
 objectClass ( 1.3.6.1.4.1.4203.1.12.1.2.1
 	name 'testPerson' sup OpenLDAPperson
 	may testTime )
